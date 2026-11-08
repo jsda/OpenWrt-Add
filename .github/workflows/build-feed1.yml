@@ -1,4 +1,4 @@
-name: Build APK Feed & ImageBuilder Bundle1
+name: Build APK Feed & ImageBuilder Bundlev1
 
 on:
   workflow_dispatch:
@@ -6,11 +6,11 @@ on:
       openwrt_majors:
         description: 'OpenWrt major versions to build (space-separated, e.g. 25)'
         required: false
-        default: '25'
+        default: 'snapshots'
         type: string
-  push:
-    branches:
-      - master
+#  push:
+#    branches:
+#      - master
 
 permissions:
   contents: write
@@ -18,7 +18,7 @@ permissions:
   id-token: write
 
 env:
-  OPENWRT_MAJORS: '25'
+  OPENWRT_MAJORS: 'snapshots'
 
 jobs:
   resolve-sdks:
@@ -39,7 +39,7 @@ jobs:
             echo "ERROR: FEED_KEY secret is not set" >&2
             exit 1
           fi
-          printf '%s\n' "$FEED_PRIVATE_KEY" | openssl rsa -pubout 2>/dev/null > /tmp/custom-feed.rsa.pub
+          printf '%s\n' "$FEED_PRIVATE_KEY" | openssl pkey -pubout 2>/dev/null > /tmp/custom-feed.rsa.pub
           cmp -s /tmp/custom-feed.rsa.pub certs/custom-feed.rsa.pub || {
             echo "ERROR: FEED_KEY does not match certs/custom-feed.rsa.pub" >&2
             exit 1
@@ -92,8 +92,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
-          - x86_64
+          - aarch64_cortex-a53
 
     steps:
       - name: Checkout Source Code
@@ -218,8 +217,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
-          - x86_64
+          - aarch64_cortex-a53
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
