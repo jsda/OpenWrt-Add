@@ -72,7 +72,7 @@ jobs:
         if: steps.commit.outputs.feed_changed == 'true' && steps.push.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run "Build APK Feed & ImageBuilder Bundle1" --ref master
+        run: gh workflow run "Build APK Feed & ImageBuilder Bundlev1" --ref master
 
       - name: Cleanup Workflow Logs
         uses: Mattraks/delete-workflow-runs@main
