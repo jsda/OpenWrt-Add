@@ -100,7 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - qualcommax-ipq60xx
+          - aarch64_generic
 
     steps:
       - name: Checkout Source Code
@@ -156,7 +156,7 @@ jobs:
           need readelf binutils
           # honk-core 的 BoringSSL/bindgen 依赖
           sudo apt-get install -y -qq --no-install-recommends libclang-dev libbpf-dev
-          if [ "${{ matrix.arch }}" = "qualcommax-ipq60xx" ]; then
+          if [ "${{ matrix.arch }}" = "aarch64_generic" ]; then
             need aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu
             rustup target add aarch64-unknown-linux-musl
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
@@ -225,7 +225,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - qualcommax-ipq60xx
+          - aarch64_generic
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
