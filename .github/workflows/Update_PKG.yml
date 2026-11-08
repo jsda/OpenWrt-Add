@@ -27,6 +27,7 @@ jobs:
       - name: Sync and Standardize Packages
         run: |
           chmod +x core/scripts/*.sh core/tools/*.sh 2>/dev/null || true
+          rm -rf apps/* legacy/* themes/*
           bash core/scripts/update.sh
 
       - name: Commit changes
@@ -71,7 +72,7 @@ jobs:
         if: steps.commit.outputs.feed_changed == 'true' && steps.push.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run "Build APK Feed & ImageBuilder Bundle" --ref master
+        run: gh workflow run "Build APK Feed & ImageBuilder Bundle1" --ref master
 
       - name: Cleanup Workflow Logs
         uses: Mattraks/delete-workflow-runs@main
