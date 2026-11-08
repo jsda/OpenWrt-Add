@@ -64,13 +64,21 @@ jobs:
             sleep 2
           done
 
-          if [ -z "$tags" ]; then
-            echo "::error::Failed to fetch tags from https://github.com/openwrt/openwrt.git"
-            exit 1
-          fi
-
           sdks=()
           for major in $majors; do
+            # 【新增】特判 snapshots / snapshot，直接映射为官方 SDK 的 snapshot 标签
+            if [ "$major" = "snapshots" ] || [ "$major" = "snapshot" ]; then
+              echo "OpenWrt ${major} -> snapshot"
+              sdks+=("snapshot")
+              continue
+            fi
+
+            # 针对稳定版大版本的解析逻辑
+            if [ -z "$tags" ]; then
+              echo "::error::Failed to fetch tags from https://github.com/openwrt/openwrt.git"
+              exit 1
+            fi
+
             latest=$(echo "$tags" | grep -E "^${major}.[0-9.]+$" | sort -V | tail -n 1 || true)
             [ -z "$latest" ] && latest=$(echo "$tags" | grep -E "^${major}." | sort -V | tail -n 1 || true)
 
