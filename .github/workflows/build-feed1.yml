@@ -100,7 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
+          - aarch64_cortex-a53
 
     steps:
       - name: Checkout Source Code
@@ -225,7 +225,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
+          - aarch64_cortex-a53
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
