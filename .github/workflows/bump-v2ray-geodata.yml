@@ -1,9 +1,9 @@
 name: Bump v2ray-geodata release
 
 on:
-  schedule:
+#  schedule:
     # 周一 01:11 Asia/Shanghai = 周日 17:11 UTC
-    - cron: '11 17 * * 0'
+#    - cron: '11 17 * * 0'
   workflow_dispatch:
 
 permissions:
