@@ -1,4 +1,0 @@
-allowBuilds:
-  esbuild: true
-minimumReleaseAgeExclude:
-  - '@eamonxg/luci-theme-devkit@0.3.2'

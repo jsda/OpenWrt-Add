@@ -1,4 +1,0 @@
-nodev	tmpfs
-	squashfs
-	ext4
-nodev	overlay

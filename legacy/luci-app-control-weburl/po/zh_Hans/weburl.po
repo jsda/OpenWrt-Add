@@ -1,5 +1,0 @@
-msgid "Control"
-msgstr "管控"
-
-msgid "Weburl"
-msgstr "过滤军刀"
