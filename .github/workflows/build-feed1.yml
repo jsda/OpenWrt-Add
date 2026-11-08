@@ -1,0 +1,444 @@
+name: Build APK Feed & ImageBuilder Bundle1
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_majors:
+        description: 'OpenWrt major versions to build (space-separated, e.g. 25)'
+        required: false
+        default: '25'
+        type: string
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  OPENWRT_MAJORS: '25'
+
+jobs:
+  resolve-sdks:
+    name: Resolve Target SDK Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      sdks: ${{ steps.matrix.outputs.sdks }}
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v7
+
+      - name: Verify feed signing key
+        env:
+          FEED_PRIVATE_KEY: ${{ secrets.FEED_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FEED_PRIVATE_KEY:-}" ]; then
+            echo "ERROR: FEED_KEY secret is not set" >&2
+            exit 1
+          fi
+          printf '%s\n' "$FEED_PRIVATE_KEY" | openssl rsa -pubout 2>/dev/null > /tmp/custom-feed.rsa.pub
+          cmp -s /tmp/custom-feed.rsa.pub certs/custom-feed.rsa.pub || {
+            echo "ERROR: FEED_KEY does not match certs/custom-feed.rsa.pub" >&2
+            exit 1
+          }
+          echo "feed signing key: ok"
+
+      - name: Resolve Latest SDK Releases (No GitHub API)
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          raw_majors="${{ inputs.openwrt_majors }}"
+          majors=$(echo "${raw_majors:-$OPENWRT_MAJORS}" | tr ',' ' ')
+          echo "Target major versions: ${majors}"
+
+          # Resolve latest release tags
+          tags=""
+          for i in {1..3}; do
+            tags=$(git ls-remote --tags --refs https://github.com/openwrt/openwrt.git 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/^v//' || true)
+            [ -n "$tags" ] && break
+            sleep 2
+          done
+
+          if [ -z "$tags" ]; then
+            echo "::error::Failed to fetch tags from https://github.com/openwrt/openwrt.git"
+            exit 1
+          fi
+
+          sdks=()
+          for major in $majors; do
+            latest=$(echo "$tags" | grep -E "^${major}.[0-9.]+$" | sort -V | tail -n 1 || true)
+            [ -z "$latest" ] && latest=$(echo "$tags" | grep -E "^${major}." | sort -V | tail -n 1 || true)
+
+            if [ -n "$latest" ]; then
+              echo "OpenWrt ${major} -> ${latest}"
+              sdks+=("$latest")
+            else
+              echo "::error::No OpenWrt release tag found for major: ${major}"
+              exit 1
+            fi
+          done
+
+          echo "sdks=$(jq -nc --args '$ARGS.positional' -- "${sdks[@]}")" >> "$GITHUB_OUTPUT"
+
+  prebuild:
+    name: Prebuild ${{ matrix.arch }} binaries on host
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_generic
+          - x86_64
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v7
+
+      - name: Restore prebuilt binaries
+        id: prebuilt-cache
+        uses: actions/cache@v6
+        with:
+          path: prebuilt
+          key: prebuilt-bin-${{ matrix.arch }}-${{ hashFiles('core/scripts/prebuild_host.sh', 'apps/**/Makefile', 'apps/luci-app-honk/honk/build_honk_core.sh', 'apps/FlowCone/Cargo.lock', 'apps/FlowCone/crates/**') }}
+          restore-keys: |
+            prebuilt-bin-${{ matrix.arch }}-
+
+      - name: Set up Go
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Resolve honk toolchain pins
+        id: honk-pins
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mk=apps/luci-app-honk/honk/Makefile
+          if [ -f "$mk" ] && grep -q '^HONK_SRC_VERSION:=' "$mk"; then
+            ./apps/luci-app-honk/honk/honk_toolchain.sh | tee "$RUNNER_TEMP/honk-toolchain.env"
+            . "$RUNNER_TEMP/honk-toolchain.env"
+            echo "zig_version=${ZIG_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "honk Makefile not on the native build model; skip toolchain pins"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install cross toolchain
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+
+          need() {
+            command -v "$1" >/dev/null 2>&1 || sudo apt-get install -y -qq --no-install-recommends "$2"
+          }
+          need clang clang
+          need llvm-strip llvm
+          need zstd zstd
+          need cmake cmake
+          need readelf binutils
+          # honk-core 的 BoringSSL/bindgen 依赖
+          sudo apt-get install -y -qq --no-install-recommends libclang-dev libbpf-dev
+          if [ "${{ matrix.arch }}" = "aarch64_generic" ]; then
+            need aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu
+            rustup target add aarch64-unknown-linux-musl
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          else
+            rustup target add x86_64-unknown-linux-musl
+          fi
+
+          if [ -f "$RUNNER_TEMP/honk-toolchain.env" ]; then
+            . "$RUNNER_TEMP/honk-toolchain.env"
+            curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+            echo "${BPF_LINKER_SHA256}  /tmp/bpf-linker.tar.zst" | sha256sum -c -
+            sudo tar --zstd -xf /tmp/bpf-linker.tar.zst -C /usr/local/bin
+            bpf-linker --version
+          fi
+
+          clang --version | head -n 1
+          llvm-strip --version | head -n 1
+
+      - name: Setup Zig for musl C/C++ cross-compilation
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true' && steps.honk-pins.outputs.available == 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.honk-pins.outputs.zig_version }}
+
+      - name: Cache Go module downloads
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ~/go/pkg/mod
+          key: prebuild-gomod-${{ matrix.arch }}-${{ hashFiles('apps/**/Makefile') }}
+          restore-keys: |
+            prebuild-gomod-${{ matrix.arch }}-
+
+      - name: Cache cargo registry
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: prebuild-cargo-${{ matrix.arch }}-${{ hashFiles('apps/openwrt-einat-ebpf/Makefile', 'apps/luci-app-honk/honk/Makefile') }}
+          restore-keys: |
+            prebuild-cargo-${{ matrix.arch }}-
+
+      - name: Prebuild host binaries
+        if: steps.prebuilt-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: ./core/scripts/prebuild_host.sh "${{ matrix.arch }}" prebuilt
+
+      - name: Upload prebuilt binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: prebuilt-${{ matrix.arch }}
+          path: prebuilt
+          if-no-files-found: error
+          retention-days: 1
+
+  build-packages:
+    name: Build ${{ matrix.arch }}-openwrt-${{ matrix.sdk }}
+    runs-on: ubuntu-latest
+    needs:
+      - resolve-sdks
+      - prebuild
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - aarch64_generic
+          - x86_64
+        sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v7
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: prebuilt-${{ matrix.arch }}
+          path: prebuilt
+
+      - name: Assemble Combined Feed (Apps + Themes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging_feed artifacts dl node_prebuilt
+          cp -a apps/* staging_feed/ 2>/dev/null || true
+          cp -a themes/* staging_feed/ 2>/dev/null || true
+          if [ -d staging_feed/feeds_packages_lang_node-prebuilt ]; then
+            cp -a staging_feed/feeds_packages_lang_node-prebuilt/. node_prebuilt/
+            rm -rf staging_feed/feeds_packages_lang_node-prebuilt
+          fi
+          REPO_ROOT=staging_feed bash core/scripts/fix_translations.sh
+          echo "Package Makefiles in feed: $(find staging_feed -name Makefile -not -path '*/src/*' | wc -l)"
+
+      - name: Apply prebuilt binaries to feed
+        shell: bash
+        run: ./core/scripts/apply_prebuilt.sh staging_feed /prebuilt prebuilt
+
+      - name: Cache OpenWrt Package Downloads (dl)
+        uses: actions/cache@v6
+        with:
+          path: dl
+          key: ${{ matrix.arch }}-${{ matrix.sdk }}-dl-${{ hashFiles('staging_feed/**/Makefile') }}
+          restore-keys: |
+            ${{ matrix.arch }}-${{ matrix.sdk }}-dl-
+
+      - name: Restore Incremental Package Cache
+        uses: actions/cache/restore@v6
+        with:
+          path: cached_apks
+          key: ${{ matrix.arch }}-${{ matrix.sdk }}-apks-${{ github.sha }}
+          restore-keys: |
+            ${{ matrix.arch }}-${{ matrix.sdk }}-apks-
+
+      - name: Ensure Cache and Working Directories
+        shell: bash
+        run: |
+          mkdir -p cached_apks artifacts
+
+      - name: Compile Packages in OpenWrt SDK Container
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="docker.io/openwrt/sdk:${{ matrix.arch }}-${{ matrix.sdk }}"
+          echo "Pulling SDK image ${image}..."
+          docker pull "${image}"
+
+          docker run --rm \
+            --user root \
+            -e UPSTREAM_URL="https://downloads.openwrt.org" \
+            -v "${{ github.workspace }}/staging_feed:/feed:ro" \
+            -v "${{ github.workspace }}/artifacts:/artifacts" \
+            -v "${{ github.workspace }}/dl:/builder/dl" \
+            -v "${{ github.workspace }}/node_prebuilt:/node_prebuilt:ro" \
+            -v "${{ github.workspace }}/prebuilt:/prebuilt:ro" \
+            -v "${{ github.workspace }}/core:/core:ro" \
+            -v "${{ github.workspace }}/cached_apks:/cached_apks" \
+            -v "${{ github.workspace }}/core/scripts/build_in_container.sh:/build.sh:ro" \
+            "${image}" \
+            bash /build.sh
+
+          sudo chown -R "$USER:$USER" "${{ github.workspace }}/artifacts" "${{ github.workspace }}/cached_apks"
+
+      - name: Show Built Files
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Built package files ==="
+          find artifacts/bin/ -type f 2>/dev/null | grep -E '.(ipk|apk)$' || true
+          echo "==========================="
+
+      - name: Prepare Staging Artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          shopt -s nullglob
+          find artifacts/bin/ -type f -name "*.apk" -exec cp {} dist/ \; 2>/dev/null || true
+          echo "Total APKs successfully prepared: $(ls -1 dist/*.apk 2>/dev/null | wc -l)"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-${{ matrix.arch }}-${{ matrix.sdk }}
+          path: artifacts/logs
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Verify package manifest
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 core/scripts/verify_manifest.py \
+            --expected artifacts/manifest/expected.txt \
+            --apk-dir artifacts/bin \
+            --allow-missing core/assets/build-allow-missing.conf
+
+      - name: Upload Build Artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: apks-${{ matrix.arch }}-${{ matrix.sdk }}
+          path: dist/*.apk
+          if-no-files-found: warn
+
+      - name: Save Incremental Package Cache
+        if: always() && hashFiles('cached_apks/fingerprints.json') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: cached_apks
+          key: ${{ matrix.arch }}-${{ matrix.sdk }}-apks-${{ github.sha }}-${{ github.run_id }}
+
+  publish-feed:
+    name: Smart Fan-out, Sign & Deploy Feed
+    needs:
+      - resolve-sdks
+      - build-packages
+    runs-on: ubuntu-latest
+    if: always() && needs.build-packages.result != 'cancelled'
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v7
+
+      - name: Download All Built APKs
+        uses: actions/download-artifact@v8
+        with:
+          path: raw_artifacts
+
+      - name: Execute Smart Fan-out
+        run: |
+          python3 core/scripts/smart_fanout.py raw_artifacts public
+
+      - name: Setup Signing Keys
+        env:
+          FEED_PRIVATE_KEY: ${{ secrets.FEED_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FEED_PRIVATE_KEY:-}" ]; then
+            echo "ERROR: FEED_KEY secret is not set; refusing to generate an ephemeral feed key" >&2
+            exit 1
+          fi
+          mkdir -p certs
+          printf '%s\n' "$FEED_PRIVATE_KEY" > certs/feed-key.pem
+          chmod 600 certs/feed-key.pem
+          openssl rsa -in certs/feed-key.pem -pubout -out /tmp/custom-feed.rsa.pub
+          cmp -s /tmp/custom-feed.rsa.pub certs/custom-feed.rsa.pub || {
+            echo "ERROR: FEED_KEY does not match certs/custom-feed.rsa.pub" >&2
+            exit 1
+          }
+          mkdir -p public/keys
+          cp certs/custom-feed.rsa.pub public/keys/custom-feed.rsa.pub
+
+      - name: Generate Signed Index (packages.adb) for Each Architecture
+        shell: bash
+        env:
+          SDK_TAG: ${{ fromJson(needs.resolve-sdks.outputs.sdks)[0] }}
+        run: |
+          set -euo pipefail
+
+          # 使用 SDK 镜像内置的 apk 工具生成 packages.adb
+          image="docker.io/openwrt/sdk:x86_64-${SDK_TAG}"
+          echo "Using SDK image ${image} for indexing"
+          docker pull "${image}"
+
+          docker run --rm --user root \
+            -v "${PWD}/public:/public" \
+            -v "${PWD}/certs:/certs:ro" \
+            -v "${PWD}/core/scripts/generate_index.sh:/generate_index.sh:ro" \
+            "${image}" bash /generate_index.sh
+
+          sudo chown -R "$USER:$USER" public
+          python3 core/scripts/generate_index_html.py public
+
+      - name: Build ImageBuilder Offline Bundle
+        run: |
+          mkdir -p dist
+          tar -czf dist/openwrt-add-apks-bundle.tar.gz -C public .
+          echo "=== ImageBuilder 离线包制作完成 ==="
+          ls -lh dist/openwrt-add-apks-bundle.tar.gz
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+      - name: Upload ImageBuilder Bundle to Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view latest-packages --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create latest-packages --title "OpenWrt-Add Precompiled APKs" --notes "Precompiled APK bundle for ImageBuilder" --repo "${{ github.repository }}"
+
+          for attempt in 1 2 3; do
+            if gh release upload latest-packages dist/openwrt-add-apks-bundle.tar.gz --clobber --repo "${{ github.repository }}"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
