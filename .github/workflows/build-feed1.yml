@@ -39,7 +39,7 @@ jobs:
             echo "ERROR: FEED_KEY secret is not set" >&2
             exit 1
           fi
-          printf '%s\n' "$FEED_PRIVATE_KEY" | openssl pkey -pubout 2>/dev/null > /tmp/custom-feed.rsa.pub
+          printf '%s\n' "$FEED_PRIVATE_KEY" | openssl rsa -pubout 2>/dev/null > /tmp/custom-feed.rsa.pub
           cmp -s /tmp/custom-feed.rsa.pub certs/custom-feed.rsa.pub || {
             echo "ERROR: FEED_KEY does not match certs/custom-feed.rsa.pub" >&2
             exit 1
@@ -100,7 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_cortex-a53
+          - aarch64_generic
 
     steps:
       - name: Checkout Source Code
@@ -225,7 +225,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_cortex-a53
+          - aarch64_generic
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
