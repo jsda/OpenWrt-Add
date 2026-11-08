@@ -45,6 +45,8 @@ tries = 3
 retry_connrefused = on
 WGETRC_EOF
 
+sed -i '/gpg --/d' setup.sh
+
 [ ! -f setup.sh ] || bash setup.sh
 
 [ -f feeds.conf.default ] || { echo "feeds.conf.default missing"; exit 1; }
