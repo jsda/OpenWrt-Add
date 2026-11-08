@@ -81,7 +81,6 @@ jobs:
 
             latest=$(echo "$tags" | grep -E "^${major}.[0-9.]+$" | sort -V | tail -n 1 || true)
             [ -z "$latest" ] && latest=$(echo "$tags" | grep -E "^${major}." | sort -V | tail -n 1 || true)
-            echo "sdks_latest=$(jq -nc --args '$ARGS.positional' -- "${sdks_latest[@]}")" >> "$GITHUB_OUTPUT"
 
             if [ -n "$latest" ]; then
               echo "OpenWrt ${major} -> ${latest}"
@@ -399,12 +398,12 @@ jobs:
       - name: Generate Signed Index (packages.adb) for Each Architecture
         shell: bash
         env:
-          SDK_TAG: ${{ fromJson(needs.resolve-sdks.outputs.sdks_latest)[0] }}
+          SDK_TAG: ${{ fromJson(needs.resolve-sdks.outputs.sdks)[0] }}
         run: |
           set -euo pipefail
 
           # 使用 SDK 镜像内置的 apk 工具生成 packages.adb
-          image="docker.io/openwrt/sdk:x86_64-${SDK_TAG}"
+          image="docker.io/openwrt/sdk:x86_64-25.12.6"
           echo "Using SDK image ${image} for indexing"
           docker pull "${image}"
 
