@@ -464,23 +464,7 @@ sync_imm_pkg() {
 # ------------------------------------------------------------------------------
 run_all_custom_sync() {
     local -a handlers=(
-        sync_openappfilter
-        sync_helloworld
-        sync_openwrt_pkgs
-        sync_openclash
-        sync_autocore_arm
-        sync_mentohust_openwrt_ipk
-        sync_einat_ebpf
-        sync_luci_einat
-        sync_openwrt_bandix
-        sync_argon_theme
-        sync_unblockmusic
-        sync_taskplan
-        sync_uugamebooster
-        sync_ap_modem
         sync_immortalwrt_luci
-        sync_lede_pkg
-        sync_imm_pkg
     )
 
     for handler in "${handlers[@]}"; do
