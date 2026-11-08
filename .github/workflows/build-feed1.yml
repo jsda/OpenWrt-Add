@@ -283,7 +283,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          image="docker.io/openwrt/sdk:${{ matrix.arch }}-25.12.6"
+          image="docker.io/openwrt/sdk:${{ matrix.arch }}-${{ matrix.sdk }}"
           echo "Pulling SDK image ${image}..."
           docker pull "${image}"
 
