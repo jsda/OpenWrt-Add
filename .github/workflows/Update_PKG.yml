@@ -2,8 +2,8 @@ name: Update PKG
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '23 20 * * *'
+#  schedule:
+#    - cron: '23 20 * * *'
 
 permissions:
   contents: write
