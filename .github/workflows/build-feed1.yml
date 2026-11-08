@@ -6,7 +6,7 @@ on:
       openwrt_majors:
         description: 'OpenWrt major versions to build (space-separated, e.g. 25)'
         required: false
-        default: 'snapshots'
+        default: 'SNAPSHOT'
         type: string
 #  push:
 #    branches:
@@ -18,7 +18,7 @@ permissions:
   id-token: write
 
 env:
-  OPENWRT_MAJORS: 'snapshots'
+  OPENWRT_MAJORS: 'SNAPSHOT'
 
 jobs:
   resolve-sdks:
@@ -66,10 +66,10 @@ jobs:
 
           sdks=()
           for major in $majors; do
-            # 【新增】特判 snapshots / snapshot，直接映射为官方 SDK 的 snapshot 标签
-            if [ "$major" = "snapshots" ] || [ "$major" = "snapshot" ]; then
-              echo "OpenWrt ${major} -> snapshot"
-              sdks+=("snapshot")
+            # 【新增】特判 SNAPSHOT / SNAPSHOT，直接映射为官方 SDK 的 SNAPSHOT 标签
+            if [ "$major" = "SNAPSHOT" ] || [ "$major" = "SNAPSHOT" ]; then
+              echo "OpenWrt ${major} -> SNAPSHOT"
+              sdks+=("SNAPSHOT")
               continue
             fi
 
@@ -100,7 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_cortex-a53
+          - aarch64_generic
 
     steps:
       - name: Checkout Source Code
@@ -156,7 +156,7 @@ jobs:
           need readelf binutils
           # honk-core 的 BoringSSL/bindgen 依赖
           sudo apt-get install -y -qq --no-install-recommends libclang-dev libbpf-dev
-          if [ "${{ matrix.arch }}" = "aarch64_cortex-a53" ]; then
+          if [ "${{ matrix.arch }}" = "aarch64_generic" ]; then
             need aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu
             rustup target add aarch64-unknown-linux-musl
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
@@ -225,7 +225,7 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_cortex-a53
+          - aarch64_generic
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
@@ -283,7 +283,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          image="docker.io/openwrt/sdk:${{ matrix.arch }}"
+          image="docker.io/openwrt/sdk:${{ matrix.arch }}-${{ matrix.sdk }}"
           echo "Pulling SDK image ${image}..."
           docker pull "${image}"
 
