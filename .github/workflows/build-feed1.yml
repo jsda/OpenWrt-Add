@@ -403,7 +403,7 @@ jobs:
           set -euo pipefail
 
           # 使用 SDK 镜像内置的 apk 工具生成 packages.adb
-          image="docker.io/openwrt/sdk:x86_64-${{ matrix.sdk }}"
+          image="docker.io/openwrt/sdk:x86_64-25.12.6"
           echo "Using SDK image ${image} for indexing"
           docker pull "${image}"
 
