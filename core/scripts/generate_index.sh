@@ -16,6 +16,10 @@ for dir in /public/*/; do
   [ -d "$dir" ] || continue
   arch=$(basename "$dir")
   [ "$arch" = keys ] && continue
+  case "$arch" in
+    aarch64_cortex-a53|x86_64) ;;
+    *) echo "::warning::[$arch] skipping non-target architecture directory"; continue ;;
+  esac
   shopt -s nullglob
   files=("$dir"*.apk)
   [ ${#files[@]} -gt 0 ] || continue
