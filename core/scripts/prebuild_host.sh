@@ -5,19 +5,20 @@
 # 在 runner 上交叉编译 Go / Rust 组件，免去 SDK 容器内工具链引导。
 # 用法:
 #   ./core/scripts/prebuild_host.sh <arch> [outdir]
-#   arch: x86_64 | aarch64_generic
+#   arch: x86_64 | aarch64_cortex-a53
 # ==============================================================================
 set -euo pipefail
 
-ARCH="${1:?usage: prebuild_host.sh <x86_64|aarch64_generic> [outdir]}"
+ARCH="${1:?usage: prebuild_host.sh <x86_64|aarch64_cortex-a53> [outdir]}"
 OUT="${2:-prebuilt}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+HONK_ARCH="$ARCH"
 case "$ARCH" in
-  x86_64)          GOARCH=amd64 ; RUST_TARGET=x86_64-unknown-linux-musl ;;
-  aarch64_generic) GOARCH=arm64 ; RUST_TARGET=aarch64-unknown-linux-musl ;;
+  x86_64)             GOARCH=amd64 ; RUST_TARGET=x86_64-unknown-linux-musl ;;
+  aarch64_cortex-a53) GOARCH=arm64 ; RUST_TARGET=aarch64-unknown-linux-musl ; HONK_ARCH=aarch64_generic ;;
   *) echo "::error::unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 
@@ -267,7 +268,8 @@ prebuild_honk() {
   rm -rf "$out"; mkdir -p "$out"
 
   [ -x "$script" ] || die "honk prebuild script not found: $script"
-  "$script" "$ARCH" "$out/honk-core" || die "honk prebuild failed via build_honk_core.sh"
+  # build_honk_core.sh 的既有目标名使用 aarch64_generic；a53 与其均为 AArch64 musl。
+  "$script" "$HONK_ARCH" "$out/honk-core" || die "honk prebuild failed via build_honk_core.sh"
 
   assert_elf "$out/honk-core"
 
