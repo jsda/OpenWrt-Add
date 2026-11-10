@@ -1,6 +1,7 @@
 //! OpenWrt fw4 integration: rule text, liveness sets and persistence files.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -44,36 +45,6 @@ pub(crate) fn check_hardware_offload_warning() {
             );
         }
     }
-}
-
-/// IPv4 source set of the srcnat exemption, matching is_private_ipv4().
-pub(crate) fn v4_src_set() -> String {
-    flowcone_common::INTERNAL_V4_PREFIXES.join(", ")
-}
-
-/// Inline srcnat rule for the generic-firewall path.
-pub(crate) fn generate_fw4_srcnat_rule_v4(iface: &str) -> String {
-    format!(
-        "oifname \"{iface}\" meta nfproto ipv4 meta l4proto udp ip saddr {{ {} }} counter return comment \"flowcone\"",
-        v4_src_set()
-    )
-}
-
-/// Inline srcnat rule for the generic-firewall path.
-pub(crate) fn generate_fw4_srcnat_rule_v6(iface: &str, is_masq: bool) -> String {
-    if is_masq {
-        format!(
-            "oifname \"{iface}\" meta nfproto ipv6 meta l4proto udp counter return comment \"flowcone\""
-        )
-    } else {
-        format!(
-            "oifname \"{iface}\" meta nfproto ipv6 meta l4proto udp ip6 saddr fc00::/7 counter return comment \"flowcone\""
-        )
-    }
-}
-
-pub(crate) fn generate_fw4_forward_rules() -> Vec<String> {
-    vec!["meta mark & 0x40000000 == 0x40000000 counter accept comment \"flowcone\"".to_string()]
 }
 
 pub(crate) fn has_table_inet_fw4() -> bool {
@@ -148,7 +119,9 @@ pub(crate) fn strip_fw4_user_block(content: &str) -> String {
 pub(crate) fn clean_firewall4_user_file() {
     if let Ok(current) = fs::read_to_string(FW4_USER_PATH) {
         let cleaned = strip_fw4_user_block(&current);
-        let _ = fs::write(FW4_USER_PATH, cleaned.trim());
+        if cleaned != current {
+            let _ = fs::write(FW4_USER_PATH, cleaned);
+        }
     }
 }
 
@@ -237,8 +210,8 @@ pub(crate) fn bypass_clause(mask: u32, val: u32) -> String {
 }
 
 /// Extra guards matching the eBPF bypass_special_udp4() checks.
-fn special_v4_clause() -> &'static str {
-    " ip saddr != 0.0.0.0/8 udp sport != { 67, 68 } udp dport != { 67, 68 } ip daddr != 255.255.255.255 ip daddr != 224.0.0.0/4 ip daddr != 169.254.0.0/16"
+pub(crate) fn special_v4_clause() -> &'static str {
+    " ip saddr != 0.0.0.0 udp sport != { 67, 68 } udp dport != { 67, 68 } ip daddr != 255.0.0.0/8 ip daddr != 224.0.0.0/4 ip daddr != 169.254.0.0/16"
 }
 
 pub(crate) fn generate_live_srcnat_rule_v4(
@@ -284,7 +257,6 @@ pub(crate) fn build_fw4_insert_script_live(
     iface: &str,
     enable_v4: bool,
     enable_v6: bool,
-    _is_v6_masq: bool,
     mark: u32,
     bypass_mask: u32,
     bypass_val: u32,
@@ -317,6 +289,14 @@ pub(crate) fn build_fw4_insert_script_live(
     script
 }
 
+fn remove_persisted(path: &str) -> bool {
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn update_chain_pre_files_live(
     iface: &str,
     enable_v4: bool,
@@ -324,9 +304,9 @@ pub(crate) fn update_chain_pre_files_live(
     mark: u32,
     bypass_mask: u32,
     bypass_val: u32,
-) {
-    let _ = fs::create_dir_all(FW4_CHAIN_PRE_SRCNAT_DIR);
-    let _ = fs::create_dir_all(FW4_CHAIN_PRE_FORWARD_DIR);
+) -> bool {
+    let mut ok = fs::create_dir_all(FW4_CHAIN_PRE_SRCNAT_DIR).is_ok();
+    ok &= fs::create_dir_all(FW4_CHAIN_PRE_FORWARD_DIR).is_ok();
 
     let mut srcnat_lines = Vec::new();
     if enable_v4 {
@@ -336,9 +316,9 @@ pub(crate) fn update_chain_pre_files_live(
         srcnat_lines.push(generate_live_srcnat_rule_v6(iface, bypass_mask, bypass_val));
     }
     if !srcnat_lines.is_empty() {
-        let _ = fs::write(FW4_CHAIN_PRE_SRCNAT_FILE, srcnat_lines.join("\n") + "\n");
+        ok &= fs::write(FW4_CHAIN_PRE_SRCNAT_FILE, srcnat_lines.join("\n") + "\n").is_ok();
     } else {
-        let _ = fs::remove_file(FW4_CHAIN_PRE_SRCNAT_FILE);
+        ok &= remove_persisted(FW4_CHAIN_PRE_SRCNAT_FILE);
     }
 
     let mut fwd_lines = Vec::new();
@@ -349,10 +329,11 @@ pub(crate) fn update_chain_pre_files_live(
         fwd_lines.push(generate_live_forward_rule_v6(iface, mark));
     }
     if !fwd_lines.is_empty() {
-        let _ = fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_lines.join("\n") + "\n");
+        ok &= fs::write(FW4_CHAIN_PRE_FORWARD_FILE, fwd_lines.join("\n") + "\n").is_ok();
     } else {
-        let _ = fs::remove_file(FW4_CHAIN_PRE_FORWARD_FILE);
+        ok &= remove_persisted(FW4_CHAIN_PRE_FORWARD_FILE);
     }
+    ok
 }
 
 pub(crate) fn v6_elements(is_masq: bool) -> &'static str {
@@ -392,21 +373,25 @@ pub(crate) fn refresh_fw4_liveness(
             .map(|p| format!("{} timeout {}s", p, LIVENESS_TIMEOUT_SEC))
             .collect::<Vec<_>>()
             .join(", ");
+        script.push_str(&format!("flush set inet fw4 {}\n", SET_V4));
         script.push_str(&format!(
             "add element inet fw4 {} {{ {} }}\n",
             SET_V4, elements
         ));
+        script.push_str(&format!("flush set inet fw4 {}\n", SET_FWD4));
         script.push_str(&format!(
             "add element inet fw4 {} {{ 0.0.0.0/0 timeout {}s }}\n",
             SET_FWD4, LIVENESS_TIMEOUT_SEC
         ));
     }
     if enable_v6 {
+        script.push_str(&format!("flush set inet fw4 {}\n", SET_V6));
         script.push_str(&format!(
             "add element inet fw4 {} {{ {} }}\n",
             SET_V6,
             v6_elements(is_v6_masq)
         ));
+        script.push_str(&format!("flush set inet fw4 {}\n", SET_FWD6));
         script.push_str(&format!(
             "add element inet fw4 {} {{ ::/0 timeout {}s }}\n",
             SET_FWD6, LIVENESS_TIMEOUT_SEC
@@ -461,33 +446,6 @@ pub(crate) fn auto_includes_enabled() -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn test_generate_fw4_chain_pre_rules() {
-        let set = flowcone_common::INTERNAL_V4_PREFIXES.join(", ");
-        let srcnat_v4 = generate_fw4_srcnat_rule_v4("eth1");
-        assert_eq!(
-            srcnat_v4,
-            format!(
-                "oifname \"eth1\" meta nfproto ipv4 meta l4proto udp ip saddr {{ {set} }} counter return comment \"flowcone\""
-            )
-        );
-        let srcnat_v6_ula = generate_fw4_srcnat_rule_v6("eth1", false);
-        assert_eq!(
-            srcnat_v6_ula,
-            "oifname \"eth1\" meta nfproto ipv6 meta l4proto udp ip6 saddr fc00::/7 counter return comment \"flowcone\""
-        );
-        let srcnat_v6_masq = generate_fw4_srcnat_rule_v6("eth1", true);
-        assert_eq!(
-            srcnat_v6_masq,
-            "oifname \"eth1\" meta nfproto ipv6 meta l4proto udp counter return comment \"flowcone\""
-        );
-        let fwds = generate_fw4_forward_rules();
-        assert_eq!(
-            fwds[0],
-            "meta mark & 0x40000000 == 0x40000000 counter accept comment \"flowcone\""
-        );
-    }
-
-    #[test]
     fn test_parse_has_ipv6_masq_ignores_nat6_partial() {
         let partial = "\
 table ip6 nat {
@@ -541,7 +499,9 @@ table ip6 nat {
     fn test_live_rules_use_sets_and_new_state() {
         let r4 = generate_live_srcnat_rule_v4("eth1", 0, 0);
         assert!(r4.contains("ip saddr @flowcone_v4"));
-        assert!(r4.contains("ip saddr != 0.0.0.0/8"));
+        assert!(r4.contains("ip saddr != 0.0.0.0"));
+        assert!(r4.contains("255.0.0.0/8"));
+        assert!(!r4.contains("255.255.255.255"));
         let r6 = generate_live_forward_rule_v6("eth1", 0x40000000);
         assert!(r6.contains("ct state new"));
         assert!(r6.contains("ip6 saddr @flowcone_fwd6"));

@@ -15,6 +15,18 @@ pub(crate) use nft::*;
 
 static LAST_LAYER: AtomicU8 = AtomicU8::new(u8::MAX);
 
+#[derive(Clone, Copy)]
+pub(crate) struct FirewallConfig<'a> {
+    pub iface: &'a str,
+    pub enable_v4: bool,
+    pub enable_v6: bool,
+    pub is_v6_masq: bool,
+    pub mark: u32,
+    pub bypass_mask: u32,
+    pub bypass_val: u32,
+    pub verbose: bool,
+}
+
 fn report_layer(layer: u8, name: &str, verbose: bool) {
     if LAST_LAYER.swap(layer, Ordering::Relaxed) != layer || verbose {
         println!("flowcone: firewall rules persisted via {}", name);
@@ -23,19 +35,17 @@ fn report_layer(layer: u8, name: &str, verbose: bool) {
 
 /// Sync firewall rules with the current address/protocol state.
 /// Returns true only if the kernel transaction succeeded.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sync_fw4_rules(
-    iface: &str,
-    min_port: u16,
-    max_port: u16,
-    enable_v4: bool,
-    enable_v6: bool,
-    is_v6_masq: bool,
-    mark: u32,
-    bypass_mask: u32,
-    bypass_val: u32,
-    verbose: bool,
-) -> bool {
+pub(crate) fn sync_fw4_rules(cfg: &FirewallConfig<'_>) -> bool {
+    let FirewallConfig {
+        iface,
+        enable_v4,
+        enable_v6,
+        is_v6_masq,
+        mark,
+        bypass_mask,
+        bypass_val,
+        verbose,
+    } = *cfg;
     check_hardware_offload_warning();
 
     let deletes = nft_ruleset_text()
@@ -43,6 +53,7 @@ pub(crate) fn sync_fw4_rules(
         .unwrap_or_default();
 
     if has_table_inet_fw4() {
+        clear_generic_tables();
         let native_includes = use_chain_pre();
         let set_file_ok = write_fw4_set_definitions();
         if !ensure_fw4_sets() {
@@ -53,15 +64,14 @@ pub(crate) fn sync_fw4_rules(
             iface,
             enable_v4,
             enable_v6,
-            is_v6_masq,
             mark,
             bypass_mask,
             bypass_val,
         );
         let ok = nft_apply_with_fallback(&deletes, &body, "inet fw4 rule sync");
         if ok {
-            if native_includes && set_file_ok {
-                update_chain_pre_files_live(
+            let chain_pre_ok = native_includes
+                && update_chain_pre_files_live(
                     iface,
                     enable_v4,
                     enable_v6,
@@ -69,13 +79,17 @@ pub(crate) fn sync_fw4_rules(
                     bypass_mask,
                     bypass_val,
                 );
+            if native_includes && set_file_ok && chain_pre_ok {
                 clean_firewall4_user_file();
             } else {
+                if native_includes && (!set_file_ok || !chain_pre_ok) {
+                    eprintln!("flowcone: error: could not persist fw4 chain-pre rules");
+                }
                 clean_chain_pre_files();
                 clean_firewall4_user_file();
             }
             refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
-            if native_includes && set_file_ok {
+            if native_includes && set_file_ok && chain_pre_ok {
                 report_layer(1, "fw4 chain-pre includes", verbose);
             } else {
                 report_layer(2, "live fw4 rules (reload is recovered by SIGHUP)", verbose);
@@ -85,8 +99,8 @@ pub(crate) fn sync_fw4_rules(
         }
         if verbose {
             println!(
-                "flowcone: synced inet fw4 rules (iface {}, v4={}, v6={}, masq6={}, ports {}-{}, mark {:#x})",
-                iface, enable_v4, enable_v6, is_v6_masq, min_port, max_port, mark
+                "flowcone: synced inet fw4 rules (iface {}, v4={}, v6={}, masq6={}, mark {:#x})",
+                iface, enable_v4, enable_v6, is_v6_masq, mark
             );
         }
         return ok;
@@ -108,42 +122,40 @@ pub(crate) fn sync_fw4_rules(
     }
 
     let standalone = postrouting_nat_chains.is_empty() && forward_filter_chains.is_empty();
+    let mut generic_tables = Vec::new();
     if standalone {
-        body.push_str(&generate_standalone_script_live(
-            iface,
+        body.push_str(&generate_standalone_script_live(cfg));
+    } else {
+        generic_tables = collect_generic_tables(
+            &postrouting_nat_chains,
+            &forward_filter_chains,
             enable_v4,
             enable_v6,
-            is_v6_masq,
+        );
+        if !ensure_generic_sets(&generic_tables) {
+            eprintln!("flowcone: error: could not create generic firewall timeout sets");
+            return false;
+        }
+        body.push_str(&build_generic_insert_script(
+            iface,
+            &postrouting_nat_chains,
+            &forward_filter_chains,
+            enable_v4,
+            enable_v6,
             mark,
             bypass_mask,
             bypass_val,
         ));
-    } else {
-        body.push_str(&build_primary_insert_script(
-            iface,
-            &postrouting_nat_chains,
-            enable_v4,
-            enable_v6,
-            is_v6_masq,
-        ));
-        if enable_v4 || enable_v6 {
-            for c in &forward_filter_chains {
-                for fwd in generate_fw4_forward_rules() {
-                    body.push_str(&format!(
-                        "insert rule {} {} {} {}\n",
-                        c.family, c.table, c.name, fwd
-                    ));
-                }
-            }
-        }
     }
 
     let ok = nft_apply_with_fallback(&deletes, &body, "Linux firewall rule sync");
     if ok {
         if standalone {
+            clear_generic_tables();
             refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
             report_layer(4, "standalone table inet flowcone", verbose);
         } else {
+            store_generic_tables(generic_tables);
             report_layer(3, "existing nftables chains", verbose);
         }
     } else {
@@ -170,16 +182,18 @@ pub(crate) fn refresh_liveness(
     is_v6_masq: bool,
     verbose: bool,
 ) -> bool {
-    if has_table_inet_fw4() {
-        return refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
+    match LAST_LAYER.load(Ordering::Relaxed) {
+        1 | 2 => refresh_fw4_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
+        3 => refresh_generic_liveness(is_v6_masq, verbose),
+        4 => refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose),
+        _ => false,
     }
-    if nft_table_exists("inet", "flowcone") {
-        return refresh_standalone_liveness(enable_v4, enable_v6, is_v6_masq, verbose);
-    }
-    false
 }
 
 pub(crate) fn liveness_supported() -> bool {
+    if LAST_LAYER.load(Ordering::Relaxed) == 3 && generic_liveness_supported() {
+        return true;
+    }
     has_table_inet_fw4() || nft_table_exists("inet", "flowcone")
 }
 
@@ -188,6 +202,7 @@ pub(crate) fn remove_rules(verbose: bool) {
     clean_firewall4_user_file();
     clean_fw4_set_definitions();
     delete_all_injected_rules(verbose);
+    remove_generic_sets(verbose);
 
     if has_table_inet_fw4() {
         remove_fw4_sets();

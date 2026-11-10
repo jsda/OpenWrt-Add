@@ -34,6 +34,8 @@ pub(crate) struct IfaceAddr {
 }
 
 const IFA_F_SECONDARY: u32 = 0x01;
+/// IPv6 privacy addresses reuse the secondary-address bit.
+const IFA_F_TEMPORARY: u32 = IFA_F_SECONDARY;
 const IFA_F_DADFAILED: u32 = 0x08;
 const IFA_F_DEPRECATED: u32 = 0x20;
 const IFA_F_TENTATIVE: u32 = 0x40;
@@ -157,24 +159,30 @@ fn pick_global_v4(addrs: &[IfaceAddr]) -> Option<[u8; 4]> {
         .map(|a| [a.addr[0], a.addr[1], a.addr[2], a.addr[3]])
 }
 
-/// Pick a global unicast IPv6 address, preferring a permanent one.
+/// Pick a global unicast IPv6 address: permanent first, then a non-temporary
+/// dynamic address, then a privacy/temporary address.
 fn pick_gua_v6(addrs: &[IfaceAddr]) -> Option<[u8; 16]> {
     let mut fallback = None;
+    let mut temporary = None;
     for a in addrs {
         // 2000::/3 only: ULA (fc00::/7) is not a WAN address even though it
         // is global scope.
         if a.family != 10 || a.scope != 0 || (a.addr[0] & 0xe0) != 0x20 {
             continue;
         }
-        if a.flags & (IFA_F_SECONDARY | IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE) != 0 {
+        if a.flags & (IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE) != 0 {
             continue;
         }
         if a.flags & IFA_F_PERMANENT != 0 {
             return Some(a.addr);
         }
-        fallback = fallback.or(Some(a.addr));
+        if a.flags & IFA_F_TEMPORARY != 0 {
+            temporary = temporary.or(Some(a.addr));
+        } else {
+            fallback = fallback.or(Some(a.addr));
+        }
     }
-    fallback
+    fallback.or(temporary)
 }
 
 /// Global addresses of one interface.
@@ -206,15 +214,11 @@ fn l2_len_for_arp_type(dev_type: u16) -> u32 {
     }
 }
 
-pub fn get_iface_l2_len(ifname: &str) -> u32 {
+pub fn get_iface_l2_len(ifname: &str) -> Option<u32> {
     let type_path = format!("/sys/class/net/{}/type", ifname);
-    let Ok(content) = std::fs::read_to_string(type_path) else {
-        return 14;
-    };
-    let Ok(dev_type) = content.trim().parse::<u16>() else {
-        return 14;
-    };
-    l2_len_for_arp_type(dev_type)
+    let content = std::fs::read_to_string(type_path).ok()?;
+    let dev_type = content.trim().parse::<u16>().ok()?;
+    Some(l2_len_for_arp_type(dev_type))
 }
 
 /// rtnetlink multicast groups: link state and IPv4/IPv6 address changes.
@@ -329,6 +333,16 @@ mod tests {
     }
 
     #[test]
+    fn test_pick_gua_v6_falls_back_to_temporary() {
+        let only_temporary = [addr(10, 0x24, IFA_F_TEMPORARY, 0)];
+        assert_eq!(pick_gua_v6(&only_temporary).unwrap()[0], 0x24);
+
+        // A non-temporary dynamic address is still preferred over privacy.
+        let mixed = [addr(10, 0x25, IFA_F_TEMPORARY, 0), addr(10, 0x26, 0, 0)];
+        assert_eq!(pick_gua_v6(&mixed).unwrap()[0], 0x26);
+    }
+
+    #[test]
     fn test_pick_global_v4() {
         // The first non-secondary global address wins.
         let addrs = [
@@ -347,6 +361,14 @@ mod tests {
         assert_eq!(super::l2_len_for_arp_type(512), 0); // ARPHRD_PPP / pppoe-wan TC data is bare IP
         assert_eq!(super::l2_len_for_arp_type(772), 0); // ARPHRD_LOOPBACK
         assert_eq!(super::l2_len_for_arp_type(65534), 0); // ARPHRD_NONE
+    }
+
+    #[test]
+    fn test_get_iface_l2_len_unknown_and_loopback() {
+        assert_eq!(get_iface_l2_len("does-not-exist-xyz"), None);
+        if std::path::Path::new("/sys/class/net/lo").exists() {
+            assert_eq!(get_iface_l2_len("lo"), Some(0));
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub struct BindingValue4 {
     pub ip: u32,
     pub port: u16,
     pub _pad: u16,
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -40,7 +40,7 @@ pub struct BindingValue6 {
     pub ip: [u8; 16],
     pub port: u16,
     pub _pad: [u16; 3],
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -78,6 +78,7 @@ pub struct FragKey4 {
     pub id: u16,
     pub proto: u8,
     pub _pad: u8,
+    pub epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -88,7 +89,7 @@ unsafe impl aya::Pod for FragKey4 {}
 pub struct FragValue4 {
     pub ip: u32,
     pub _pad: u32,
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -102,6 +103,7 @@ pub struct FragKey6 {
     pub id: u32,
     pub proto: u8,
     pub _pad: [u8; 3],
+    pub epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -111,14 +113,14 @@ unsafe impl aya::Pod for FragKey6 {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FragValue6 {
     pub ip: [u8; 16],
-    pub last_seen: u64,
+    pub last_seen: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for FragValue6 {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalConfig {
     pub wan_ip4: u32,
     pub bypass_mark_mask: u32,
@@ -132,10 +134,21 @@ pub struct GlobalConfig {
     pub enabled_v4: u32,
     pub enabled_v6: u32,
     pub flowcone_mark: u32,
+    pub frag_epoch: u32,
 }
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for GlobalConfig {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigStore {
+    pub active: u32,
+    pub slots: [GlobalConfig; 2],
+}
+
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for ConfigStore {}
 
 /// Non-routable IPv4 source ranges, as CIDR strings.
 ///
@@ -204,114 +217,72 @@ pub fn is_ula_ipv6(addr: &[u8; 16]) -> bool {
     (addr[0] & 0xfe) == 0xfc
 }
 
-/// Check if IPv6 address is a valid routable internal unicast address (excluding link-local, multicast, loopback)
+/// Check if IPv6 address is a valid routable internal unicast address.
+///
+/// In ULA-only mode (`allow_all_internal = false`), only ULA `fc00::/7` is allowed.
+/// In full NAT66 mode (`allow_all_internal = true`), Global Unicast `2000::/3`
+/// is also accepted. This aligns exactly with the firewall liveness exemption
+/// sets (`{2000::/3, fc00::/7}`), avoiding Double NAT while excluding multicast
+/// (`ff00::/8`), link-local (`fe80::/10`), loopback (`::1`), and unspecified (`::`).
 #[inline(always)]
 pub fn is_routable_internal_ipv6(addr: &[u8; 16], allow_all_internal: bool) -> bool {
-    // Multicast: ff00::/8
-    if addr[0] == 0xff {
-        return false;
-    }
-    // Link-Local: fe80::/10 (fe80..febf)
-    if addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80 {
-        return false;
-    }
-    // Loopback / Unspecified: ::1 or ::
-    let hi = u64::from_ne_bytes([
-        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
-    ]);
-    let mid = u32::from_ne_bytes([addr[8], addr[9], addr[10], addr[11]]);
-    let lo_hi = u16::from_ne_bytes([addr[12], addr[13]]);
-    if hi == 0 && mid == 0 && lo_hi == 0 && addr[14] == 0 && (addr[15] == 0 || addr[15] == 1) {
-        return false;
-    }
-
     if is_ula_ipv6(addr) {
         return true;
     }
+    if !allow_all_internal {
+        return false;
+    }
 
-    allow_all_internal
+    (addr[0] & 0xe0) == 0x20
 }
 
 pub const MAX_BINDINGS: u32 = 65536;
-pub const FRAG_MAP_ENTRIES: u32 = 8192;
-pub const SESSION_EVENT_ENTRIES: u32 = 16384;
+/// Per-direction, per-family fragment cache capacity. Keep this the single
+/// source of truth for the eBPF LRU maps.
+pub const FRAG_MAP_ENTRIES: u32 = 1024;
+/// Capacity in bytes for the session event ring buffers.
+/// Must be a power of 2 and a multiple of page size (4096).
+/// 262,144 bytes (256 KiB) holds ~10,000 session creation events.
+pub const SESSION_EVENT_RINGBUF_BYTES: u32 = 262144;
 /// One byte of state per port; 65536 entries cover the full u16 port space.
 pub const PORT_STATE_ENTRIES: u32 = 65536;
 /// Each parity queue can hold the whole pool; duplicates are skipped via the
 /// per-port state, and a full queue sets a user-space rebuild flag.
 pub const PORT_QUEUE_ENTRIES: u32 = 65536;
 
+pub const PORT_FREE_BIT: u8 = 1;
+pub const PORT_QUEUED_BIT: u8 = 2;
+
+/// Port popped from queue. Clears `PORT_QUEUED_BIT`.
+#[inline(always)]
+pub fn port_state_on_unqueue(state: u8) -> u8 {
+    state & !PORT_QUEUED_BIT
+}
+
+/// Port bound to an active session. Clears `PORT_FREE_BIT`.
+#[inline(always)]
+pub fn port_state_on_bound(state: u8) -> u8 {
+    state & !PORT_FREE_BIT
+}
+
+/// Evaluate whether a released port needs to be pushed back to queue.
+/// Returns `(needs_queue_push, new_state)`.
+///
+/// If `PORT_QUEUED_BIT` is already set (e.g. redundant release or port preservation
+/// left a stale queue entry), no duplicate queue push is needed.
+#[inline(always)]
+pub fn port_state_on_release(state: u8) -> (bool, u8) {
+    let next = state | PORT_FREE_BIT;
+    if next & PORT_QUEUED_BIT != 0 {
+        (false, next)
+    } else {
+        (true, next | PORT_QUEUED_BIT)
+    }
+}
+
 /// Packet mark set on DNAT-translated inbound packets. The daemon can override
 /// this through GlobalConfig to avoid colliding with proxy/policy marks.
 pub const DEFAULT_FLOWCONE_MARK: u32 = 0x40000000;
-
-/// RFC 4787 port allocation:
-/// - Port preservation (REQ-3)
-/// - Parity preservation (REQ-4)
-/// - Parity relaxation fallback
-///
-/// The caller's is_free closure is the atomic port claim. This function is
-/// pure control flow and never allocates.
-pub fn select_rfc4787_port<F: FnMut(u16) -> bool>(
-    preferred: u16,
-    min_port: u16,
-    max_port: u16,
-    seed: u32,
-    mut is_free: F,
-) -> Option<u16> {
-    if min_port > max_port {
-        return None;
-    }
-
-    // 1. Port preservation
-    if preferred >= min_port && preferred <= max_port && is_free(preferred) {
-        return Some(preferred);
-    }
-
-    // 2. Parity preservation. 64 probes keeps the false-exhaustion rate
-    // negligible even at high occupancy without a full port-state scan.
-    let parity = (preferred & 1) as u32;
-    let minp = min_port as u32;
-    let maxp = max_port as u32;
-
-    let first = minp + ((parity ^ (minp & 1)) != 0) as u32;
-    if first <= maxp {
-        let cnt = (maxp - first) / 2 + 1;
-        if cnt > 0 {
-            let mut port = first + 2 * (seed % cnt);
-            let mut i: usize = 0;
-            while i < 64 && (i as u32) < cnt {
-                if port != preferred as u32 && is_free(port as u16) {
-                    return Some(port as u16);
-                }
-                port += 2;
-                if port > maxp {
-                    port = first;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    // 3. Parity relaxation fallback
-    let total_ports = maxp - minp + 1;
-    if total_ports > 0 {
-        let mut port = minp + (seed.wrapping_add(1) % total_ports);
-        let mut k: usize = 0;
-        while k < 64 && (k as u32) < total_ports {
-            if port != preferred as u32 && is_free(port as u16) {
-                return Some(port as u16);
-            }
-            port += 1;
-            if port > maxp {
-                port = minp;
-            }
-            k += 1;
-        }
-    }
-
-    None
-}
 
 #[cfg(test)]
 mod tests {
@@ -425,49 +396,39 @@ mod tests {
         assert!(!is_routable_internal_ipv6(&gua, false));
         // True if allow_all_internal is true (GUA+ULA mode)
         assert!(is_routable_internal_ipv6(&gua, true));
-    }
 
-    #[test]
-    fn test_rfc4787_port_preservation() {
-        // Preferred port is free -> must allocate preferred port (REQ-3)
-        let port = select_rfc4787_port(5000, 1024, 65535, 12345, |p| p == 5000);
-        assert_eq!(port, Some(5000));
-    }
+        // Exact 2000::/3 boundaries and non-GUA exclusions
+        let mut pfx_100 = [0u8; 16];
+        pfx_100[0] = 0x01;
+        pfx_100[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_100, false));
+        assert!(!is_routable_internal_ipv6(&pfx_100, true));
 
-    #[test]
-    fn test_rfc4787_parity_preservation() {
-        // Preferred even port 5000 is occupied. Must allocate an even port (REQ-4)
-        let even_alloc = select_rfc4787_port(5000, 1024, 65535, 99999, |p| p != 5000);
-        assert!(even_alloc.is_some());
-        let p_even = even_alloc.unwrap();
-        assert_eq!(p_even % 2, 0, "Expected even port for preferred even port");
+        let mut pfx_1fff = [0u8; 16];
+        pfx_1fff[0] = 0x1f;
+        pfx_1fff[1] = 0xff;
+        pfx_1fff[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_1fff, false));
+        assert!(!is_routable_internal_ipv6(&pfx_1fff, true));
 
-        // Preferred odd port 5001 is occupied. Must allocate an odd port (REQ-4)
-        let odd_alloc = select_rfc4787_port(5001, 1024, 65535, 88888, |p| p != 5001);
-        assert!(odd_alloc.is_some());
-        let p_odd = odd_alloc.unwrap();
-        assert_eq!(p_odd % 2, 1, "Expected odd port for preferred odd port");
-    }
+        let mut pfx_2000 = [0u8; 16];
+        pfx_2000[0] = 0x20;
+        pfx_2000[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_2000, false));
+        assert!(is_routable_internal_ipv6(&pfx_2000, true));
 
-    #[test]
-    fn test_rfc4787_parity_relaxation_fallback() {
-        // Preferred even port 5000 is occupied, and ALL even ports are occupied.
-        // Must fallback to an available odd port (REQ-4 Fallback)
-        let fallback_alloc = select_rfc4787_port(5000, 1024, 1030, 42, |p| p % 2 != 0);
-        assert!(fallback_alloc.is_some());
-        let p = fallback_alloc.unwrap();
-        assert_eq!(
-            p % 2,
-            1,
-            "Expected fallback to odd port when even ports exhausted"
-        );
-    }
+        let mut pfx_3fff = [0u8; 16];
+        pfx_3fff[0] = 0x3f;
+        pfx_3fff[1] = 0xff;
+        pfx_3fff[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_3fff, false));
+        assert!(is_routable_internal_ipv6(&pfx_3fff, true));
 
-    #[test]
-    fn test_rfc4787_full_exhaustion() {
-        // No ports free -> returns None
-        let none_alloc = select_rfc4787_port(5000, 1024, 1030, 42, |_| false);
-        assert_eq!(none_alloc, None);
+        let mut pfx_4000 = [0u8; 16];
+        pfx_4000[0] = 0x40;
+        pfx_4000[15] = 1;
+        assert!(!is_routable_internal_ipv6(&pfx_4000, false));
+        assert!(!is_routable_internal_ipv6(&pfx_4000, true));
     }
 
     #[test]
@@ -479,8 +440,7 @@ mod tests {
                 octets[i] = part.parse().unwrap();
             }
             // The matcher is defined over raw packet bytes, i.e. network byte
-            // order. Build the first and last address in that same order; the
-            // old code used from_ne_bytes/to_ne_bytes and was vacuous on LE.
+            // order. Build the first and last address in that same order.
             let base_raw = u32::from_ne_bytes(octets);
             let base_be = u32::from_be_bytes(octets);
             let host_bits = 32 - len.parse::<u32>().unwrap();
@@ -499,7 +459,52 @@ mod tests {
 
     #[test]
     fn test_global_config_layout() {
-        assert_eq!(core::mem::size_of::<GlobalConfig>(), 52);
+        assert_eq!(core::mem::size_of::<GlobalConfig>(), 56);
         assert_eq!(core::mem::align_of::<GlobalConfig>(), 4);
+        assert_eq!(core::mem::size_of::<ConfigStore>(), 116);
+        assert_eq!(core::mem::align_of::<ConfigStore>(), 4);
+    }
+
+    #[test]
+    fn test_port_lifecycle_state_machine() {
+        // Initial state after pool rebuild: both FREE and QUEUED bits set.
+        let initial = PORT_FREE_BIT | PORT_QUEUED_BIT;
+        assert_eq!(initial, 0x03);
+
+        // 1. Normal allocation flow:
+        // Pop from queue -> unqueue clears QUEUED_BIT.
+        let unqueued = port_state_on_unqueue(initial);
+        assert_eq!(unqueued, PORT_FREE_BIT); // 0x01: free but unqueued
+
+        // Claim port -> bound clears FREE_BIT.
+        let bound = port_state_on_bound(unqueued);
+        assert_eq!(bound, 0); // 0x00: fully bound to active session
+
+        // Session expires -> release:
+        let (needs_push, released) = port_state_on_release(bound);
+        assert!(needs_push);
+        assert_eq!(released, PORT_FREE_BIT | PORT_QUEUED_BIT); // 0x03: ready in queue
+
+        // 2. Port preservation flow (direct claim without pop):
+        // Preferred port claimed directly while stale entry remains in queue.
+        let preserved_bound = port_state_on_bound(initial);
+        assert_eq!(preserved_bound, PORT_QUEUED_BIT); // 0x02: bound, but QUEUED_BIT remains
+
+        // When the stale queue entry is popped later:
+        let stale_popped = port_state_on_unqueue(preserved_bound);
+        assert_eq!(stale_popped, 0); // Both bits clear
+        // Inbound claim will fail (port already in use). The pop handler checks:
+        // `stale_popped & PORT_FREE_BIT != 0` -> false! Entry is discarded without requeueing.
+
+        // If release is called while stale QUEUED_BIT was still present:
+        let (needs_push, refreshed) = port_state_on_release(preserved_bound);
+        assert!(!needs_push); // Stale entry already in queue, do not push duplicate!
+        assert_eq!(refreshed, PORT_FREE_BIT | PORT_QUEUED_BIT);
+
+        // 3. Duplicate release guard:
+        // Calling release on an already free/queued port does not push a duplicate entry.
+        let (needs_push, dup_state) = port_state_on_release(PORT_FREE_BIT | PORT_QUEUED_BIT);
+        assert!(!needs_push);
+        assert_eq!(dup_state, PORT_FREE_BIT | PORT_QUEUED_BIT);
     }
 }
