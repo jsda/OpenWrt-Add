@@ -1,4 +1,4 @@
-name: Build APK Feed & ImageBuilder Bundle v1
+name: Build APK Feed & ImageBuilder Bundlev1
 
 on:
   workflow_dispatch:
