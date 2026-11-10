@@ -1,10 +1,10 @@
-name: Build APK Feed & ImageBuilder Bundlev1
+name: Build APK Feed & ImageBuilder Bundle v1
 
 on:
   workflow_dispatch:
     inputs:
       openwrt_majors:
-        description: 'OpenWrt major versions to build (space-separated, e.g. 25)'
+        description: '仅支持 SNAPSHOT；其他版本将被拒绝'
         required: false
         default: 'SNAPSHOT'
         type: string
@@ -46,51 +46,33 @@ jobs:
           }
           echo "feed signing key: ok"
 
-      - name: Resolve Latest SDK Releases (No GitHub API)
+      - name: Resolve SNAPSHOT SDK Matrix
         id: matrix
+        env:
+          REQUESTED_OPENWRT_MAJORS: ${{ inputs.openwrt_majors }}
         shell: bash
         run: |
           set -euo pipefail
 
-          raw_majors="${{ inputs.openwrt_majors }}"
-          majors=$(echo "${raw_majors:-$OPENWRT_MAJORS}" | tr ',' ' ')
-          echo "Target major versions: ${majors}"
+          requested="${REQUESTED_OPENWRT_MAJORS:-$OPENWRT_MAJORS}"
+          requested="${requested//,/ }"
+          read -r -a majors <<< "$requested"
 
-          # Resolve latest release tags
-          tags=""
-          for i in {1..3}; do
-            tags=$(git ls-remote --tags --refs https://github.com/openwrt/openwrt.git 2>/dev/null | awk -F'/' '{print $NF}' | sed 's/^v//' || true)
-            [ -n "$tags" ] && break
-            sleep 2
-          done
+          if [ "${#majors[@]}" -eq 0 ]; then
+            echo "::error::At least one SDK channel must be specified"
+            exit 1
+          fi
 
-          sdks=()
-          for major in $majors; do
-            # 【新增】特判 SNAPSHOT / SNAPSHOT，直接映射为官方 SDK 的 SNAPSHOT 标签
-            if [ "$major" = "SNAPSHOT" ] || [ "$major" = "SNAPSHOT" ]; then
-              echo "OpenWrt ${major} -> SNAPSHOT"
-              sdks+=("SNAPSHOT")
-              continue
-            fi
-
-            # 针对稳定版大版本的解析逻辑
-            if [ -z "$tags" ]; then
-              echo "::error::Failed to fetch tags from https://github.com/openwrt/openwrt.git"
-              exit 1
-            fi
-
-            latest=$(echo "$tags" | grep -E "^${major}.[0-9.]+$" | sort -V | tail -n 1 || true)
-            [ -z "$latest" ] && latest=$(echo "$tags" | grep -E "^${major}." | sort -V | tail -n 1 || true)
-
-            if [ -n "$latest" ]; then
-              echo "OpenWrt ${major} -> ${latest}"
-              sdks+=("$latest")
-            else
-              echo "::error::No OpenWrt release tag found for major: ${major}"
+          for major in "${majors[@]}"; do
+            if [ "$major" != "SNAPSHOT" ]; then
+              echo "::error::This workflow only builds OpenWrt SNAPSHOT; unsupported value: $major"
               exit 1
             fi
           done
 
+          # Always resolve to one unique SNAPSHOT entry.
+          sdks=("SNAPSHOT")
+          echo "Target SDKs: ${sdks[*]}"
           echo "sdks=$(jq -nc --args '$ARGS.positional' -- "${sdks[@]}")" >> "$GITHUB_OUTPUT"
 
   prebuild:
@@ -100,7 +82,8 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
+          - aarch64_cortex-a53
+          - x86_64
 
     steps:
       - name: Checkout Source Code
@@ -156,7 +139,7 @@ jobs:
           need readelf binutils
           # honk-core 的 BoringSSL/bindgen 依赖
           sudo apt-get install -y -qq --no-install-recommends libclang-dev libbpf-dev
-          if [ "${{ matrix.arch }}" = "aarch64_generic" ]; then
+          if [ "${{ matrix.arch }}" = "aarch64_cortex-a53" ]; then
             need aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu
             rustup target add aarch64-unknown-linux-musl
             echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
@@ -225,7 +208,8 @@ jobs:
       fail-fast: false
       matrix:
         arch:
-          - aarch64_generic
+          - aarch64_cortex-a53
+          - x86_64
         sdk: ${{ fromJson(needs.resolve-sdks.outputs.sdks) }}
 
     steps:
@@ -395,7 +379,7 @@ jobs:
           mkdir -p public/keys
           cp certs/custom-feed.rsa.pub public/keys/custom-feed.rsa.pub
 
-      - name: Generate Signed Index (packages.adb) for Each Architecture
+      - name: Generate Signed Index (packages.adb) for a53 and x86_64
         shell: bash
         env:
           SDK_TAG: ${{ fromJson(needs.resolve-sdks.outputs.sdks)[0] }}
@@ -403,7 +387,7 @@ jobs:
           set -euo pipefail
 
           # 使用 SDK 镜像内置的 apk 工具生成 packages.adb
-          image="docker.io/openwrt/sdk:x86_64-25.12.6"
+          image="docker.io/openwrt/sdk:x86_64-${SDK_TAG}"
           echo "Using SDK image ${image} for indexing"
           docker pull "${image}"
 
